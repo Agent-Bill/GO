@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,7 +29,7 @@ type Client struct {
 // Init initializes a new AgentBill client
 func Init(config Config) *Client {
 	if config.BaseURL == "" {
-		config.BaseURL = "https://bgwyprqxtdreuutzpbgw.supabase.co"
+		config.BaseURL = "https://uenhjwdtnxtchlmqarjo.supabase.co"
 	}
 	return &Client{
 		config: config,
@@ -61,22 +62,116 @@ func (w *OpenAIWrapper) ChatCompletion(ctx context.Context, model string, messag
 		span.End()
 	}()
 
-	// This is a wrapper - actual OpenAI call would go here
-	// For now, returning a placeholder
-	response := map[string]interface{}{
-		"usage": map[string]interface{}{
-			"prompt_tokens":     100,
-			"completion_tokens": 50,
-			"total_tokens":      150,
-		},
+	// Build request payload
+	requestBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+	}
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		span.SetStatus(1, err.Error())
+		return nil, err
 	}
 
-	span.SetAttribute("response.prompt_tokens", 100)
-	span.SetAttribute("response.completion_tokens", 50)
-	span.SetAttribute("response.total_tokens", 150)
-	span.SetStatus(0, "")
+	// Make actual OpenAI API call
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		err := fmt.Errorf("OPENAI_API_KEY environment variable not set")
+		span.SetStatus(1, err.Error())
+		return nil, err
+	}
 
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonData))
+	if err != nil {
+		span.SetStatus(1, err.Error())
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		span.SetStatus(1, err.Error())
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("OpenAI API returned status: %d", resp.StatusCode)
+		span.SetStatus(1, err.Error())
+		return nil, err
+	}
+
+	// Parse response
+	var response map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		span.SetStatus(1, err.Error())
+		return nil, err
+	}
+
+	// Extract token usage
+	if usage, ok := response["usage"].(map[string]interface{}); ok {
+		if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
+			span.SetAttribute("response.prompt_tokens", int(promptTokens))
+		}
+		if completionTokens, ok := usage["completion_tokens"].(float64); ok {
+			span.SetAttribute("response.completion_tokens", int(completionTokens))
+		}
+		if totalTokens, ok := usage["total_tokens"].(float64); ok {
+			span.SetAttribute("response.total_tokens", int(totalTokens))
+		}
+	}
+
+	span.SetStatus(0, "")
 	return response, nil
+}
+
+// Signal represents a custom event with revenue
+type Signal struct {
+	EventName  string                 `json:"event_name"`
+	Revenue    float64                `json:"revenue"`
+	CustomerID string                 `json:"customer_id"`
+	Timestamp  int64                  `json:"timestamp"`
+	Data       map[string]interface{} `json:"data"`
+}
+
+// TrackSignal tracks a custom signal/event with revenue
+func (c *Client) TrackSignal(ctx context.Context, signal Signal) error {
+	url := fmt.Sprintf("%s/functions/v1/record-signals", c.config.BaseURL)
+	
+	signal.CustomerID = c.config.CustomerID
+	signal.Timestamp = time.Now().Unix()
+	if signal.Data == nil {
+		signal.Data = make(map[string]interface{})
+	}
+	
+	jsonData, err := json.Marshal(signal)
+	if err != nil {
+		return err
+	}
+	
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.config.APIKey))
+	req.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if c.config.Debug {
+		fmt.Printf("[AgentBill] Signal tracked: %s, revenue: $%.2f\n", signal.EventName, signal.Revenue)
+	}
+	
+	return nil
 }
 
 // Flush flushes pending telemetry data
@@ -114,6 +209,10 @@ func (t *Tracer) StartSpan(name string, attributes map[string]interface{}) *Span
 	traceID := uuid.New().String()
 	spanID := uuid.New().String()[:16]
 
+	if attributes == nil {
+		attributes = make(map[string]interface{})
+	}
+	
 	attributes["service.name"] = "agentbill-go-sdk"
 	if t.config.CustomerID != "" {
 		attributes["customer.id"] = t.config.CustomerID

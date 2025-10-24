@@ -1,4 +1,4 @@
-module github.com/agentbill/agentbill-go
+module github.com/Agent-Bill/Go
 
 go 1.21
 
